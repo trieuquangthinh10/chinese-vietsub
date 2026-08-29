@@ -7,7 +7,7 @@ from translator import process
 BASE = Path(__file__).resolve().parent.parent
 UPLOADS = BASE / "uploads"
 OUTPUTS = BASE / "outputs"
-FRONTEND = BASE / "frontend"
+FRONTEND = BASE 
 UPLOADS.mkdir(exist_ok=True)
 OUTPUTS.mkdir(exist_ok=True)
 
