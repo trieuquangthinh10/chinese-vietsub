@@ -16,7 +16,7 @@ jobs = {}
 
 @app.get("/")
 def home():
-    return send_from_directory(FRONTEND, "index.html")
+    return send_file(BASE / "index.html")
 
 @app.get("/static/<path:name>")
 def static_files(name):
