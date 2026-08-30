@@ -1,5 +1,8 @@
 import os
 import json
+import re
+import time
+import shutil
 import subprocess
 import tempfile
 from pathlib import Path
@@ -8,168 +11,220 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from openai import OpenAI
 
 
-# =========================
+# ============================================================
 # CONFIG
-# =========================
+# ============================================================
 
-STT_MODEL = os.environ.get(
-    "STT_MODEL",
-    "gpt-4o-transcribe"
+STT_MODEL = os.getenv("STT_MODEL", "gpt-4o-transcribe")
+TEXT_MODEL = os.getenv("TEXT_MODEL", "gpt-4o-mini")
+TTS_MODEL = os.getenv("TTS_MODEL", "gpt-4o-mini-tts")
+TTS_VOICE = os.getenv("TTS_VOICE", "alloy")
+
+MAX_VIDEO_SECONDS = max(
+    30,
+    int(os.getenv("MAX_VIDEO_SECONDS", "600"))
 )
 
-TEXT_MODEL = os.environ.get(
-    "TEXT_MODEL",
-    "gpt-4o-mini"
+STT_CHUNK_SECONDS = max(
+    30,
+    int(os.getenv("STT_CHUNK_SECONDS", "180"))
 )
 
-TTS_MODEL = os.environ.get(
-    "TTS_MODEL",
-    "gpt-4o-mini-tts"
-)
-
-TTS_VOICE = os.environ.get(
-    "TTS_VOICE",
-    "alloy"
-)
-
-MAX_VIDEO_SECONDS = int(
-    os.environ.get(
-        "MAX_VIDEO_SECONDS",
-        "600"
+# Overlap nhỏ để không cắt mất câu ở ranh giới.
+STT_OVERLAP_SECONDS = max(
+    0.0,
+    min(
+        float(os.getenv("STT_OVERLAP_SECONDS", "1.5")),
+        5.0
     )
 )
 
+STT_WORKERS = max(
+    1,
+    min(
+        int(os.getenv("STT_WORKERS", "2")),
+        3
+    )
+)
 
-# =========================
-# MAIN PROCESS
-# =========================
+TTS_WORKERS = max(
+    1,
+    min(
+        int(os.getenv("TTS_WORKERS", "2")),
+        3
+    )
+)
 
-def process(inp, out, cb, region):
+ORIGINAL_AUDIO_VOLUME = max(
+    0.0,
+    min(
+        float(os.getenv("ORIGINAL_AUDIO_VOLUME", "0.10")),
+        1.0
+    )
+)
+
+STT_SAMPLE_RATE = 16000
+TTS_SAMPLE_RATE = 48000
+MAX_RETRIES = 3
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def process(inp, out, cb=None, region=None):
+    cb = cb or (lambda progress, message: None)
+
+    inp = Path(inp)
+    out = Path(out)
+
+    validate_input(inp)
+    check_ffmpeg()
+
+    api_key = os.getenv("OPENAI_API_KEY")
+
+    if not api_key:
+        raise RuntimeError(
+            "OPENAI_API_KEY chưa được cấu hình trên Render."
+        )
+
     client = OpenAI(
-        api_key=os.environ["OPENAI_API_KEY"],
-        max_retries=2
+        api_key=api_key,
+        max_retries=0
     )
 
-    with tempfile.TemporaryDirectory() as temp:
+    with tempfile.TemporaryDirectory(
+        prefix="vietsub_v6_"
+    ) as temp:
+
         td = Path(temp)
 
-        # ---------------------------------
-        # 1. ANALYZE VIDEO
-        # ---------------------------------
+        # ====================================================
+        # VIDEO INFO
+        # ====================================================
 
-        cb(7, "Đang phân tích video…")
+        cb(3, "Đang kiểm tra video…")
 
-        width, height, duration = probe_video(inp)
+        info = probe_video(inp)
 
-        if duration > MAX_VIDEO_SECONDS:
-            duration = MAX_VIDEO_SECONDS
+        width = info["width"]
+        height = info["height"]
+        source_duration = info["duration"]
+        has_audio = info["has_audio"]
 
-        # Region vẫn được giữ lại để CHE phụ đề cũ.
-        # KHÔNG dùng region để nhận diện nội dung nữa.
-
-        x = max(
-            0,
-            min(
-                int(width * float(region.get("x", 0))),
-                width - 2
-            )
+        duration = min(
+            source_duration,
+            float(MAX_VIDEO_SECONDS)
         )
 
-        y = max(
-            0,
-            min(
-                int(height * float(region.get("y", 0))),
-                height - 2
-            )
-        )
-
-        w = max(
-            10,
-            min(
-                int(width * float(region.get("w", 1))),
-                width - x
-            )
-        )
-
-        h = max(
-            10,
-            min(
-                int(height * float(region.get("h", 0.25))),
-                height - y
-            )
-        )
-
-        # ---------------------------------
-        # 2. EXTRACT AUDIO
-        # ---------------------------------
-
-        cb(
-            12,
-            "Đang tách âm thanh tiếng Trung…"
-        )
-
-        audio_file = td / "source_audio.mp3"
-
-        subprocess.run(
-            [
-                "ffmpeg",
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-y",
-                "-i",
-                inp,
-                "-t",
-                str(duration),
-                "-vn",
-                "-ac",
-                "1",
-                "-ar",
-                "16000",
-                "-c:a",
-                "libmp3lame",
-                "-b:a",
-                "64k",
-                str(audio_file)
-            ],
-            check=True
-        )
-
-        if not audio_file.exists():
+        if duration <= 0:
             raise RuntimeError(
-                "Không thể tách âm thanh khỏi video."
+                "Video có thời lượng không hợp lệ."
             )
 
-        # ---------------------------------
-        # 3. SPEECH TO TEXT
-        # ---------------------------------
+        # ====================================================
+        # REGION
+        # ====================================================
 
-        cb(
-            20,
-            "Đang nghe và nhận diện tiếng Trung…"
+        x, y, w, h = normalize_region(
+            width,
+            height,
+            region
         )
 
-        segments = transcribe_audio(
+        # ====================================================
+        # AUDIO
+        # ====================================================
+
+        if not has_audio:
+            raise RuntimeError(
+                "Video không có luồng âm thanh. "
+                "Không thể nhận diện tiếng Trung để dịch."
+            )
+
+        cb(8, "Đang tách âm thanh…")
+
+        source_audio = (
+            td / "source_audio.wav"
+        )
+
+        extract_audio(
+            inp,
+            source_audio,
+            duration
+        )
+
+        validate_file(
+            source_audio,
+            "Không thể tách âm thanh khỏi video."
+        )
+
+        # ====================================================
+        # CHUNKS
+        # ====================================================
+
+        cb(12, "Đang chia âm thanh…")
+
+        chunks_dir = td / "chunks"
+        chunks_dir.mkdir(
+            parents=True,
+            exist_ok=True
+        )
+
+        chunks = split_audio(
+            source_audio,
+            chunks_dir,
+            duration
+        )
+
+        if not chunks:
+            raise RuntimeError(
+                "Không tạo được audio chunk."
+            )
+
+        # ====================================================
+        # STT
+        # ====================================================
+
+        cb(
+            16,
+            f"Đang nhận diện tiếng Trung… 0/{len(chunks)}"
+        )
+
+        segments = transcribe_parallel(
             client,
-            audio_file,
+            chunks,
+            duration,
             cb
         )
 
         if not segments:
             raise RuntimeError(
-                "Không nhận diện được lời thoại tiếng Trung trong video."
+                "Không nhận diện được lời thoại tiếng Trung."
             )
 
-        # ---------------------------------
-        # 4. TRANSLATE
-        # ---------------------------------
+        # ====================================================
+        # CLEAN
+        # ====================================================
 
-        cb(
-            48,
-            "Đang dịch lời thoại sang tiếng Việt…"
+        cb(43, "Đang xử lý lời thoại…")
+
+        segments = clean_segments(
+            segments
         )
 
-        translated = translate_segments(
+        if not segments:
+            raise RuntimeError(
+                "Không còn lời thoại hợp lệ sau khi xử lý."
+            )
+
+        # ====================================================
+        # TRANSLATE
+        # ====================================================
+
+        cb(46, "Đang dịch sang tiếng Việt…")
+
+        translated = translate_parallel(
             client,
             segments,
             cb
@@ -177,31 +232,36 @@ def process(inp, out, cb, region):
 
         if not translated:
             raise RuntimeError(
-                "Không có nội dung để dịch."
+                "Không tạo được bản dịch."
             )
 
-        # ---------------------------------
-        # 5. SRT
-        # ---------------------------------
+        # ====================================================
+        # SRT
+        # ====================================================
 
-        srt = td / "vietsub.srt"
+        srt_file = td / "vietsub.srt"
 
         write_srt(
-            srt,
+            srt_file,
             translated
         )
 
-        # ---------------------------------
-        # 6. TTS
-        # ---------------------------------
-
-        cb(
-            72,
-            "Đang tạo giọng lồng tiếng Việt…"
+        validate_file(
+            srt_file,
+            "Không tạo được file subtitle."
         )
 
+        # ====================================================
+        # TTS
+        # ====================================================
+
+        cb(70, "Đang tạo giọng Việt…")
+
         voice_dir = td / "voices"
-        voice_dir.mkdir()
+        voice_dir.mkdir(
+            parents=True,
+            exist_ok=True
+        )
 
         voice_track = td / "voice.wav"
 
@@ -214,29 +274,34 @@ def process(inp, out, cb, region):
             cb
         )
 
-        if not voice_track.exists():
-            raise RuntimeError(
-                "Không tạo được giọng lồng tiếng."
-            )
+        validate_file(
+            voice_track,
+            "Không tạo được giọng Việt."
+        )
 
-        # ---------------------------------
-        # 7. RENDER
-        # ---------------------------------
+        # ====================================================
+        # RENDER
+        # ====================================================
 
         cb(
-            93,
+            94,
             "Đang che phụ đề cũ và hoàn thiện video…"
         )
 
         render_video(
             inp,
             out,
-            srt,
+            srt_file,
             voice_track,
             x,
             y,
             w,
-            h
+            h,
+            duration
+        )
+
+        validate_output(
+            out
         )
 
         cb(
@@ -244,10 +309,49 @@ def process(inp, out, cb, region):
             "🎉 Hoàn tất! Video đã được dịch và lồng tiếng."
         )
 
+        return str(out)
 
-# =========================
-# VIDEO PROBE
-# =========================
+
+# ============================================================
+# INPUT
+# ============================================================
+
+def validate_input(path):
+    if not path.exists():
+        raise RuntimeError(
+            f"Không tìm thấy file video đầu vào: {path}"
+        )
+
+    if not path.is_file():
+        raise RuntimeError(
+            f"Đường dẫn đầu vào không phải file: {path}"
+        )
+
+    if path.stat().st_size < 1024:
+        raise RuntimeError(
+            "File video đầu vào rỗng hoặc bị hỏng."
+        )
+
+
+def check_ffmpeg():
+    missing = []
+
+    if shutil.which("ffmpeg") is None:
+        missing.append("ffmpeg")
+
+    if shutil.which("ffprobe") is None:
+        missing.append("ffprobe")
+
+    if missing:
+        raise RuntimeError(
+            "Render thiếu: "
+            + ", ".join(missing)
+        )
+
+
+# ============================================================
+# FFPROBE
+# ============================================================
 
 def probe_video(path):
     result = subprocess.run(
@@ -255,57 +359,104 @@ def probe_video(path):
             "ffprobe",
             "-v",
             "error",
-            "-show_entries",
-            "stream=codec_type,width,height,duration:"
-            "format=duration",
+            "-show_streams",
+            "-show_format",
             "-of",
             "json",
-            path
+            str(path)
         ],
-        check=True,
         capture_output=True,
         text=True
     )
 
-    data = json.loads(
-        result.stdout
+    if result.returncode != 0:
+        error = (
+            result.stderr.strip()
+            or "FFprobe không đọc được file."
+        )
+
+        raise RuntimeError(
+            "FFprobe không đọc được video: "
+            + error
+        )
+
+    try:
+        data = json.loads(
+            result.stdout
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            f"FFprobe trả về dữ liệu không hợp lệ: {exc}"
+        )
+
+    streams = data.get(
+        "streams",
+        []
     )
 
-    stream = next(
+    video_stream = next(
         (
-            s
-            for s in data.get("streams", [])
-            if s.get("codec_type") == "video"
+            stream
+            for stream in streams
+            if stream.get("codec_type") == "video"
         ),
         None
     )
 
-    if not stream:
+    if not video_stream:
         raise RuntimeError(
-            "Không tìm thấy luồng video."
+            "Không tìm thấy luồng video trong file đầu vào."
         )
 
-    width = int(
-        stream.get("width") or 0
+    width = safe_int(
+        video_stream.get("width"),
+        0
     )
 
-    height = int(
-        stream.get("height") or 0
+    height = safe_int(
+        video_stream.get("height"),
+        0
     )
-
-    duration = float(
-        stream.get("duration") or 0
-    )
-
-    if duration <= 0:
-        duration = float(
-            data.get("format", {})
-            .get("duration") or 0
-        )
 
     if width <= 0 or height <= 0:
         raise RuntimeError(
             "Không đọc được kích thước video."
+        )
+
+    duration = safe_float(
+        video_stream.get("duration"),
+        0
+    )
+
+    if duration <= 0:
+        duration = safe_float(
+            data.get("format", {}).get("duration"),
+            0
+        )
+
+    if duration <= 0:
+        # Một số file có duration ở stream dạng N/A.
+        # Thử packet duration.
+        result2 = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=duration",
+                "-of",
+                "default=nw=1:nk=1",
+                str(path)
+            ],
+            capture_output=True,
+            text=True
+        )
+
+        duration = safe_float(
+            result2.stdout.strip(),
+            0
         )
 
     if duration <= 0:
@@ -313,315 +464,954 @@ def probe_video(path):
             "Không xác định được thời lượng video."
         )
 
-    return width, height, duration
+    has_audio = any(
+        stream.get("codec_type") == "audio"
+        for stream in streams
+    )
+
+    return {
+        "width": width,
+        "height": height,
+        "duration": duration,
+        "has_audio": has_audio
+    }
 
 
-# =========================
-# SPEECH TO TEXT
-# =========================
+# ============================================================
+# REGION
+# ============================================================
 
-def transcribe_audio(client, audio_file, cb):
-    """
-    Nghe trực tiếp audio tiếng Trung.
+def normalize_region(
+    width,
+    height,
+    region
+):
+    region = region or {}
 
-    Không OCR.
-    Không cần phụ đề Trung.
-    """
+    rx = safe_float(
+        region.get("x"),
+        0
+    )
 
-    try:
-        with open(
-            audio_file,
-            "rb"
-        ) as f:
+    ry = safe_float(
+        region.get("y"),
+        0
+    )
 
-            transcript = client.audio.transcriptions.create(
-                model=STT_MODEL,
-                file=f,
-                response_format="verbose_json",
-                timestamp_granularities=["segment"],
-                language="zh",
-                temperature=0
-            )
+    rw = safe_float(
+        region.get("w"),
+        1
+    )
 
-    except Exception as e:
-        raise RuntimeError(
-            f"Lỗi nhận diện giọng nói: {e}"
+    rh = safe_float(
+        region.get("h"),
+        0.25
+    )
+
+    rx = max(
+        0.0,
+        min(rx, 0.999)
+    )
+
+    ry = max(
+        0.0,
+        min(ry, 0.999)
+    )
+
+    rw = max(
+        0.01,
+        min(rw, 1.0 - rx)
+    )
+
+    rh = max(
+        0.01,
+        min(rh, 1.0 - ry)
+    )
+
+    x = even(
+        int(width * rx)
+    )
+
+    y = even(
+        int(height * ry)
+    )
+
+    w = even(
+        int(width * rw)
+    )
+
+    h = even(
+        int(height * rh)
+    )
+
+    x = max(
+        0,
+        min(x, max(0, width - 2))
+    )
+
+    y = max(
+        0,
+        min(y, max(0, height - 2))
+    )
+
+    w = max(
+        2,
+        min(w, width - x)
+    )
+
+    h = max(
+        2,
+        min(h, height - y)
+    )
+
+    return x, y, w, h
+
+
+# ============================================================
+# AUDIO
+# ============================================================
+
+def extract_audio(
+    video,
+    output,
+    duration
+):
+    run_ffmpeg(
+        [
+            "-y",
+            "-i",
+            str(video),
+            "-t",
+            f"{duration:.3f}",
+            "-vn",
+            "-ac",
+            "1",
+            "-ar",
+            str(STT_SAMPLE_RATE),
+            "-c:a",
+            "pcm_s16le",
+            str(output)
+        ]
+    )
+
+
+# ============================================================
+# CHUNKS
+# ============================================================
+
+def split_audio(
+    audio,
+    directory,
+    duration
+):
+    chunks = []
+
+    chunk_size = max(
+        30,
+        STT_CHUNK_SECONDS
+    )
+
+    overlap = min(
+        STT_OVERLAP_SECONDS,
+        chunk_size * 0.10
+    )
+
+    main_start = 0.0
+    index = 0
+
+    while main_start < duration - 0.01:
+
+        main_end = min(
+            duration,
+            main_start + chunk_size
         )
 
-    segments = getattr(
-        transcript,
+        # Chunk thực tế có thêm phần overlap.
+        chunk_start = max(
+            0.0,
+            main_start - overlap
+        )
+
+        chunk_end = main_end
+
+        length = (
+            chunk_end
+            - chunk_start
+        )
+
+        if length <= 0:
+            break
+
+        output = (
+            directory
+            / f"chunk_{index:04d}.wav"
+        )
+
+        run_ffmpeg(
+            [
+                "-y",
+                "-ss",
+                f"{chunk_start:.3f}",
+                "-i",
+                str(audio),
+                "-t",
+                f"{length:.3f}",
+                "-ac",
+                "1",
+                "-ar",
+                str(STT_SAMPLE_RATE),
+                "-c:a",
+                "pcm_s16le",
+                str(output)
+            ]
+        )
+
+        validate_file(
+            output,
+            f"Không tạo được audio chunk {index + 1}."
+        )
+
+        chunks.append(
+            {
+                "path": output,
+                "index": index,
+                "offset": chunk_start,
+                "main_start": main_start,
+                "main_end": main_end,
+                "real_end": chunk_end
+            }
+        )
+
+        if main_end >= duration:
+            break
+
+        main_start = main_end
+        index += 1
+
+    return chunks
+
+
+# ============================================================
+# STT
+# ============================================================
+
+def transcribe_parallel(
+    client,
+    chunks,
+    duration,
+    cb
+):
+    all_segments = []
+
+    total = len(chunks)
+    completed = 0
+
+    with ThreadPoolExecutor(
+        max_workers=STT_WORKERS
+    ) as executor:
+
+        futures = {
+            executor.submit(
+                transcribe_one,
+                client,
+                chunk
+            ): chunk
+            for chunk in chunks
+        }
+
+        for future in as_completed(
+            futures
+        ):
+            chunk = futures[future]
+
+            try:
+                result = future.result()
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Lỗi STT chunk "
+                    f"{chunk['index'] + 1}: {exc}"
+                )
+
+            all_segments.extend(
+                result
+            )
+
+            completed += 1
+
+            cb(
+                16 + int(
+                    26 *
+                    completed /
+                    max(1, total)
+                ),
+                (
+                    "Đang nhận diện tiếng Trung… "
+                    f"{completed}/{total}"
+                )
+            )
+
+    all_segments.sort(
+        key=lambda item: (
+            item["start"],
+            item["end"]
+        )
+    )
+
+    return remove_duplicates(
+        all_segments
+    )
+
+
+def transcribe_one(
+    client,
+    chunk
+):
+    last_error = None
+
+    for attempt in range(
+        MAX_RETRIES
+    ):
+        try:
+            with open(
+                chunk["path"],
+                "rb"
+            ) as audio:
+
+                response = (
+                    client.audio.transcriptions.create(
+                        model=STT_MODEL,
+                        file=audio,
+                        response_format="verbose_json",
+                        timestamp_granularities=[
+                            "segment"
+                        ],
+                        language="zh",
+                        temperature=0
+                    )
+                )
+
+            return parse_stt(
+                response,
+                chunk
+            )
+
+        except Exception as exc:
+            last_error = exc
+
+            text = str(
+                exc
+            ).lower()
+
+            if is_auth_error(text):
+                raise RuntimeError(
+                    "OPENAI_API_KEY không hợp lệ. "
+                    "Kiểm tra Render Environment."
+                )
+
+            if is_permanent_error(text):
+                raise RuntimeError(
+                    f"OpenAI từ chối audio: {exc}"
+                )
+
+            if attempt < MAX_RETRIES - 1:
+                time.sleep(
+                    retry_delay(
+                        text,
+                        attempt
+                    )
+                )
+
+    raise RuntimeError(
+        f"STT thất bại: {last_error}"
+    )
+
+
+def parse_stt(
+    response,
+    chunk
+):
+    raw_segments = getattr(
+        response,
         "segments",
         None
     )
 
-    if not segments:
+    if not raw_segments:
         return []
 
-    result = []
+    output = []
 
-    total = len(segments)
+    for item in raw_segments:
 
-    for i, segment in enumerate(
-        segments
-    ):
-        text = getattr(
-            segment,
-            "text",
-            ""
+        text = str(
+            getattr(
+                item,
+                "text",
+                ""
+            ) or ""
+        ).strip()
+
+        if not text:
+            continue
+
+        local_start = safe_float(
+            getattr(
+                item,
+                "start",
+                None
+            ),
+            -1
         )
 
-        start = getattr(
-            segment,
-            "start",
-            None
+        local_end = safe_float(
+            getattr(
+                item,
+                "end",
+                None
+            ),
+            -1
         )
 
-        end = getattr(
-            segment,
-            "end",
-            None
+        if (
+            local_start < 0
+            or local_end <= local_start
+        ):
+            continue
+
+        global_start = (
+            chunk["offset"]
+            + local_start
+        )
+
+        global_end = (
+            chunk["offset"]
+            + local_end
+        )
+
+        # Chỉ giữ phần thuộc vùng chính của chunk.
+        # Chunk đầu giữ toàn bộ.
+        if chunk["index"] > 0:
+            if global_end <= chunk["main_start"]:
+                continue
+
+            # Nếu câu bắt đầu trong phần overlap
+            # nhưng kết thúc sau main_start,
+            # giữ nó và để dedupe xử lý.
+            global_start = max(
+                global_start,
+                chunk["main_start"]
+            )
+
+        global_end = min(
+            global_end,
+            chunk["main_end"]
+        )
+
+        if global_end <= global_start:
+            continue
+
+        text = clean_stt_text(
+            text
         )
 
         if not text:
             continue
 
-        if start is None or end is None:
-            continue
-
-        text = str(text).strip()
-
-        if not text:
-            continue
-
-        # Chỉ giữ những đoạn có chữ Trung.
         if not contains_chinese(text):
             continue
 
-        result.append(
+        output.append(
             {
-                "start": float(start),
-                "end": float(end),
+                "start": global_start,
+                "end": global_end,
                 "zh": text
             }
         )
 
-        cb(
-            20 + int(
-                25 * (i + 1) /
-                max(1, total)
-            ),
-            f"Đang nhận diện lời thoại… "
-            f"{i + 1}/{total}"
-        )
-
-    return merge_segments(result)
+    return output
 
 
-def contains_chinese(text):
-    return any(
-        "\u3400" <= ch <= "\u9fff"
-        for ch in text
-    )
+# ============================================================
+# DEDUP
+# ============================================================
 
-
-# =========================
-# MERGE STT SEGMENTS
-# =========================
-
-def merge_segments(segments):
+def remove_duplicates(
+    segments
+):
     if not segments:
         return []
 
     result = []
 
-    for seg in segments:
-        text = seg["zh"].strip()
+    for current in segments:
 
-        if not text:
-            continue
-
-        if not result:
-            result.append(
-                {
-                    "start": seg["start"],
-                    "end": seg["end"],
-                    "zh": text
-                }
-            )
-            continue
-
-        last = result[-1]
-
-        # Nếu STT chia cùng câu thành nhiều đoạn
-        # và khoảng nghỉ rất ngắn thì gộp.
-        gap = (
-            seg["start"] -
-            last["end"]
+        current_norm = normalize_text(
+            current["zh"]
         )
 
-        if gap <= 0.35:
-            last["end"] = max(
-                last["end"],
-                seg["end"]
+        duplicate = False
+
+        for previous in reversed(
+            result[-10:]
+        ):
+            distance = (
+                current["start"]
+                - previous["start"]
             )
 
-            last["zh"] += " " + text
+            if distance > 4:
+                break
 
-        else:
+            previous_norm = normalize_text(
+                previous["zh"]
+            )
+
+            if (
+                current_norm
+                == previous_norm
+            ):
+                previous["end"] = max(
+                    previous["end"],
+                    current["end"]
+                )
+
+                duplicate = True
+                break
+
+            # Chỉ xử lý containment với câu tương đối dài.
+            if (
+                len(current_norm) >= 12
+                and len(previous_norm) >= 12
+                and abs(
+                    current["start"]
+                    - previous["start"]
+                ) <= 2
+                and (
+                    current_norm in previous_norm
+                    or previous_norm in current_norm
+                )
+            ):
+                if len(current_norm) > len(
+                    previous_norm
+                ):
+                    previous["zh"] = current[
+                        "zh"
+                    ]
+
+                    previous["start"] = min(
+                        previous["start"],
+                        current["start"]
+                    )
+
+                    previous["end"] = max(
+                        previous["end"],
+                        current["end"]
+                    )
+
+                else:
+                    previous["end"] = max(
+                        previous["end"],
+                        current["end"]
+                    )
+
+                duplicate = True
+                break
+
+        if not duplicate:
             result.append(
-                {
-                    "start": seg["start"],
-                    "end": seg["end"],
-                    "zh": text
-                }
+                current.copy()
             )
 
     return result
 
 
-# =========================
-# TRANSLATION
-# =========================
+def normalize_text(text):
+    return re.sub(
+        r"\s+",
+        "",
+        str(text or "").lower()
+    )
 
-def translate_segments(
+
+# ============================================================
+# CLEAN
+# ============================================================
+
+def clean_segments(
+    segments
+):
+    cleaned = []
+
+    for item in segments:
+
+        text = clean_stt_text(
+            item.get("zh", "")
+        )
+
+        if not text:
+            continue
+
+        start = safe_float(
+            item.get("start"),
+            0
+        )
+
+        end = safe_float(
+            item.get("end"),
+            0
+        )
+
+        if end <= start:
+            continue
+
+        cleaned.append(
+            {
+                "start": start,
+                "end": end,
+                "zh": text
+            }
+        )
+
+    cleaned.sort(
+        key=lambda item: item["start"]
+    )
+
+    # Không merge bừa các câu.
+    # Chỉ gộp đoạn cực sát nhau nếu câu trước chưa kết thúc.
+    result = []
+
+    for current in cleaned:
+
+        if not result:
+            result.append(
+                current.copy()
+            )
+            continue
+
+        previous = result[-1]
+
+        gap = (
+            current["start"]
+            - previous["end"]
+        )
+
+        if (
+            0 <= gap <= 0.10
+            and same_sentence(
+                previous["zh"]
+            )
+            and len(previous["zh"]) < 100
+        ):
+            previous["end"] = max(
+                previous["end"],
+                current["end"]
+            )
+
+            previous["zh"] += (
+                " "
+                + current["zh"]
+            )
+
+        else:
+            result.append(
+                current.copy()
+            )
+
+    return result
+
+
+def clean_stt_text(text):
+    text = str(
+        text or ""
+    ).strip()
+
+    if not text:
+        return ""
+
+    for marker in (
+        "[BLANK_AUDIO]",
+        "[MUSIC]",
+        "[music]",
+        "(music)",
+        "（音乐）",
+        "[SILENCE]",
+        "[silence]",
+        "（静音）"
+    ):
+        text = text.replace(
+            marker,
+            ""
+        )
+
+    text = re.sub(
+        r"\s+",
+        " ",
+        text
+    ).strip()
+
+    return text
+
+
+def same_sentence(text):
+    return not str(
+        text or ""
+    ).rstrip().endswith(
+        (
+            "。",
+            "！",
+            "？",
+            "!",
+            "?",
+            "…",
+            "；",
+            ";"
+        )
+    )
+
+
+def contains_chinese(text):
+    return any(
+        "\u3400"
+        <= char
+        <= "\u9fff"
+        for char in str(text)
+    )
+
+
+# ============================================================
+# TRANSLATION
+# ============================================================
+
+def translate_parallel(
     client,
     segments,
     cb
 ):
-    results = []
+    batch_size = 40
 
-    batch_size = 30
-    total = len(segments)
+    batches = []
 
     for start in range(
         0,
-        total,
+        len(segments),
         batch_size
     ):
-        chunk = segments[
-            start:
-            start + batch_size
-        ]
-
-        context = segments[
-            max(0, start - 5):
-            min(
-                total,
-                start + batch_size + 5
+        batches.append(
+            (
+                start,
+                segments[
+                    start:
+                    start + batch_size
+                ]
             )
-        ]
-
-        context_text = "\n".join(
-            x["zh"]
-            for x in context
         )
 
-        target_text = "\n".join(
-            f"{i + 1}. {x['zh']}"
-            for i, x in enumerate(chunk)
-        )
+    completed = 0
+    results = []
 
-        prompt = f"""
-Bạn là biên dịch viên Trung-Việt chuyên nghiệp.
+    # Hai request song song là mức hợp lý.
+    workers = min(
+        2,
+        len(batches)
+    )
 
-Dịch lời thoại tiếng Trung sang tiếng Việt tự nhiên
-để LỒNG TIẾNG vào video.
+    with ThreadPoolExecutor(
+        max_workers=max(1, workers)
+    ) as executor:
 
-YÊU CẦU:
-- Dịch đúng nghĩa.
-- Dịch tự nhiên như người Việt nói.
-- Câu ngắn gọn, dễ đọc thành tiếng.
-- Giữ tên nhân vật nhất quán.
-- Không giải thích.
-- Không thêm nội dung.
-- Không bỏ câu.
-- Giữ đúng thứ tự.
+        futures = {
+            executor.submit(
+                translate_batch,
+                client,
+                batch
+            ): start
+            for start, batch in batches
+        }
 
-CONTEXT:
-{context_text}
+        finished = []
 
-CẦN DỊCH:
-{target_text}
-
-Chỉ trả JSON:
-{{"translations":["..."]}}
-
-Phải có đúng {len(chunk)} câu.
-"""
-
-        response = client.chat.completions.create(
-            model=TEXT_MODEL,
-            temperature=0.2,
-            response_format={
-                "type": "json_object"
-            },
-            messages=[
-                {
-                    "role": "system",
-                    "content":
-                        "Bạn chuyên dịch Trung-Việt "
-                        "cho video lồng tiếng."
-                },
-                {
-                    "role": "user",
-                    "content": prompt
-                }
-            ]
-        )
-
-        data = json.loads(
-            response.choices[0]
-            .message.content
-        )
-
-        translations = data.get(
-            "translations"
-        )
-
-        if (
-            not isinstance(
-                translations,
-                list
-            )
-            or len(translations)
-            != len(chunk)
+        for future in as_completed(
+            futures
         ):
-            raise RuntimeError(
-                "AI trả về số lượng câu dịch không hợp lệ."
+            start = futures[future]
+
+            try:
+                translated = future.result()
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Lỗi dịch batch: {exc}"
+                )
+
+            finished.append(
+                (
+                    start,
+                    translated
+                )
             )
 
-        for seg, vi in zip(
-            chunk,
-            translations
-        ):
-            results.append(
-                {
-                    "start": seg["start"],
-                    "end": seg["end"],
-                    "vi": str(vi).strip()
-                }
+            completed += 1
+
+            cb(
+                46 + int(
+                    22 *
+                    completed /
+                    max(1, len(batches))
+                ),
+                (
+                    "Đang dịch… "
+                    f"{completed}/{len(batches)}"
+                )
             )
 
-        completed = min(
-            start + batch_size,
-            total
-        )
+    finished.sort(
+        key=lambda item: item[0]
+    )
 
-        cb(
-            48 + int(
-                24 * completed /
-                total
-            ),
-            f"Đang dịch… "
-            f"{completed}/{total}"
-        )
+    for _, batch in finished:
+        results.extend(batch)
 
     return results
 
 
-# =========================
+def translate_batch(
+    client,
+    segments
+):
+    target = "\n".join(
+        f"{i + 1}. {item['zh']}"
+        for i, item in enumerate(
+            segments
+        )
+    )
+
+    prompt = f"""
+Dịch tiếng Trung sang tiếng Việt cho video lồng tiếng.
+
+YÊU CẦU:
+- Đúng nghĩa.
+- Tự nhiên như người Việt nói.
+- Ngắn gọn.
+- Dễ đọc thành tiếng.
+- Không giải thích.
+- Không thêm nội dung.
+- Không bỏ nội dung.
+- Giữ đúng thứ tự.
+- Mỗi câu input tương ứng đúng một output.
+- Không đánh số trong câu dịch.
+
+INPUT:
+{target}
+
+Chỉ trả JSON:
+{{"translations":["..."]}}
+
+Phải có đúng {len(segments)} phần tử.
+"""
+
+    last_error = None
+
+    for attempt in range(
+        MAX_RETRIES
+    ):
+        try:
+            response = (
+                client.chat.completions.create(
+                    model=TEXT_MODEL,
+                    temperature=0.1,
+                    response_format={
+                        "type": "json_object"
+                    },
+                    messages=[
+                        {
+                            "role": "system",
+                            "content":
+                                "Bạn là biên dịch viên "
+                                "Trung-Việt chuyên nghiệp."
+                        },
+                        {
+                            "role": "user",
+                            "content": prompt
+                        }
+                    ]
+                )
+            )
+
+            content = (
+                response.choices[0]
+                .message.content
+            )
+
+            data = json.loads(
+                content
+            )
+
+            translations = data.get(
+                "translations"
+            )
+
+            if (
+                not isinstance(
+                    translations,
+                    list
+                )
+                or len(translations)
+                != len(segments)
+            ):
+                raise RuntimeError(
+                    "AI trả về sai số lượng câu."
+                )
+
+            output = []
+
+            for segment, translation in zip(
+                segments,
+                translations
+            ):
+                vi = str(
+                    translation or ""
+                ).strip()
+
+                if not vi:
+                    vi = segment["zh"]
+
+                output.append(
+                    {
+                        "start": segment["start"],
+                        "end": segment["end"],
+                        "vi": vi
+                    }
+                )
+
+            return output
+
+        except Exception as exc:
+            last_error = exc
+
+            text = str(
+                exc
+            ).lower()
+
+            if is_auth_error(text):
+                raise RuntimeError(
+                    "OPENAI_API_KEY không hợp lệ."
+                )
+
+            if attempt < MAX_RETRIES - 1:
+                time.sleep(
+                    retry_delay(
+                        text,
+                        attempt
+                    )
+                )
+
+    raise RuntimeError(
+        f"Dịch thất bại: {last_error}"
+    )
+
+
+# ============================================================
 # TTS
-# =========================
+# ============================================================
 
 def create_voice_track(
     client,
@@ -631,131 +1421,220 @@ def create_voice_track(
     duration,
     cb
 ):
-    audio_files = []
-
     total = len(segments)
 
-    def make_one(item):
-        i, seg = item
-
-        text = seg["vi"].strip()
-
-        if not text:
-            return None
-
-        filename = (
-            voice_dir /
-            f"voice_{i:05d}.mp3"
+    if total == 0:
+        raise RuntimeError(
+            "Không có câu để tạo TTS."
         )
-
-        response = client.audio.speech.create(
-            model=TTS_MODEL,
-            voice=TTS_VOICE,
-            input=text,
-            response_format="mp3"
-        )
-
-        response.write_to_file(
-            str(filename)
-        )
-
-        return seg, filename
 
     completed = 0
+    audio_files = []
 
     with ThreadPoolExecutor(
-        max_workers=4
-    ) as pool:
+        max_workers=TTS_WORKERS
+    ) as executor:
 
-        futures = [
-            pool.submit(
-                make_one,
-                item
-            )
-            for item in enumerate(
+        futures = {
+            executor.submit(
+                create_one_tts,
+                client,
+                index,
+                segment,
+                voice_dir
+            ): index
+            for index, segment in enumerate(
                 segments
             )
-        ]
+        }
 
         for future in as_completed(
             futures
         ):
-            item = future.result()
+            index = futures[future]
+
+            try:
+                audio_files.append(
+                    future.result()
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    f"TTS câu {index + 1} lỗi: {exc}"
+                )
 
             completed += 1
 
-            if item:
-                audio_files.append(item)
-
             cb(
-                72 + int(
-                    19 *
+                70 + int(
+                    20 *
                     completed /
                     max(1, total)
                 ),
-                f"Đang tạo giọng Việt… "
-                f"{completed}/{total}"
+                (
+                    "Đang tạo giọng Việt… "
+                    f"{completed}/{total}"
+                )
             )
 
     audio_files.sort(
-        key=lambda item:
-        item[0]["start"]
+        key=lambda item: item[0]["start"]
     )
 
+    build_voice_track(
+        audio_files,
+        output,
+        duration
+    )
+
+
+def create_one_tts(
+    client,
+    index,
+    segment,
+    voice_dir
+):
+    text = str(
+        segment.get("vi", "")
+    ).strip()
+
+    if not text:
+        raise RuntimeError(
+            "Câu rỗng."
+        )
+
+    output = (
+        voice_dir
+        / f"voice_{index:05d}.mp3"
+    )
+
+    last_error = None
+
+    for attempt in range(
+        MAX_RETRIES
+    ):
+        try:
+            response = (
+                client.audio.speech.create(
+                    model=TTS_MODEL,
+                    voice=TTS_VOICE,
+                    input=text,
+                    response_format="mp3"
+                )
+            )
+
+            response.write_to_file(
+                str(output)
+            )
+
+            validate_file(
+                output,
+                "TTS không tạo được file."
+            )
+
+            return (
+                segment,
+                output
+            )
+
+        except Exception as exc:
+            last_error = exc
+
+            text_error = str(
+                exc
+            ).lower()
+
+            if is_auth_error(
+                text_error
+            ):
+                raise RuntimeError(
+                    "OPENAI_API_KEY không hợp lệ."
+                )
+
+            if attempt < MAX_RETRIES - 1:
+                time.sleep(
+                    retry_delay(
+                        text_error,
+                        attempt
+                    )
+                )
+
+    raise RuntimeError(
+        str(last_error)
+    )
+
+
+def build_voice_track(
+    audio_files,
+    output,
+    duration
+):
     if not audio_files:
         raise RuntimeError(
-            "Không tạo được giọng Việt."
+            "Không có audio TTS."
         )
 
     inputs = []
     filters = []
+    labels = []
 
-    for index, (
-        seg,
+    for i, (
+        segment,
         audio
     ) in enumerate(
         audio_files
     ):
-        inputs += [
-            "-i",
-            str(audio)
-        ]
+
+        inputs.extend(
+            [
+                "-i",
+                str(audio)
+            ]
+        )
 
         delay = max(
             0,
             int(
-                seg["start"] * 1000
+                segment["start"] * 1000
             )
         )
 
+        label = f"voice{i}"
+
         filters.append(
-            f"[{index}:a]"
+            f"[{i}:a]"
             f"adelay={delay}:all=1"
-            f"[voice{index}]"
+            f"[{label}]"
         )
 
-    labels = "".join(
-        f"[voice{i}]"
-        for i in range(
-            len(audio_files)
+        labels.append(
+            f"[{label}]"
         )
-    )
 
-    filters.append(
-        f"{labels}"
-        f"amix="
-        f"inputs={len(audio_files)}:"
-        f"duration=longest:"
-        f"dropout_transition=0"
-        f"[mixed]"
-    )
+    if len(labels) == 1:
+        filters.append(
+            f"{labels[0]}"
+            "aresample=48000,"
+            "aformat="
+            "sample_rates=48000:"
+            "channel_layouts=stereo"
+            "[mixed]"
+        )
+    else:
+        filters.append(
+            "".join(labels)
+            + f"amix=inputs={len(labels)}:"
+            "duration=longest:"
+            "dropout_transition=0:"
+            "normalize=1,"
+            "aresample=48000,"
+            "aformat="
+            "sample_rates=48000:"
+            "channel_layouts=stereo"
+            "[mixed]"
+        )
 
-    subprocess.run(
+    run_ffmpeg(
         [
-            "ffmpeg",
-            "-hide_banner",
-            "-loglevel",
-            "error",
             "-y",
             *inputs,
             "-filter_complex",
@@ -763,7 +1642,7 @@ def create_voice_track(
             "-map",
             "[mixed]",
             "-t",
-            str(duration),
+            f"{duration:.3f}",
             "-ar",
             "48000",
             "-ac",
@@ -771,14 +1650,13 @@ def create_voice_track(
             "-c:a",
             "pcm_s16le",
             str(output)
-        ],
-        check=True
+        ]
     )
 
 
-# =========================
-# VIDEO RENDER
-# =========================
+# ============================================================
+# RENDER
+# ============================================================
 
 def render_video(
     inp,
@@ -788,49 +1666,30 @@ def render_video(
     x,
     y,
     w,
-    h
+    h,
+    duration
 ):
-    srt_path = ffmpeg_path(srt)
-
-    audio_check = subprocess.run(
-        [
-            "ffprobe",
-            "-v",
-            "error",
-            "-select_streams",
-            "a:0",
-            "-show_entries",
-            "stream=index",
-            "-of",
-            "csv=p=0",
-            inp
-        ],
-        capture_output=True,
-        text=True
+    srt_path = ffmpeg_subtitle_path(
+        srt
     )
 
-    has_audio = bool(
-        audio_check.stdout.strip()
-    )
-
-    # Làm mờ/che đúng vùng subtitle cũ.
     video_filter = (
-        f"[0:v]split=2"
-        f"[original][blur];"
+        f"[0:v]"
+        f"split=2"
+        f"[base][blur_source];"
 
-        f"[blur]"
+        f"[blur_source]"
         f"crop={w}:{h}:{x}:{y},"
         f"boxblur=18:3"
         f"[blurred];"
 
-        f"[original][blurred]"
+        f"[base][blurred]"
         f"overlay={x}:{y}"
         f"[clean];"
 
         f"[clean]"
-        f"subtitles='{srt_path}'"
-        f":force_style='"
-        f"FontName=Arial,"
+        f"subtitles={srt_path}:"
+        f"force_style='"
         f"FontSize=22,"
         f"PrimaryColour=&H00FFFFFF,"
         f"OutlineColour=&H00101010,"
@@ -841,73 +1700,58 @@ def render_video(
         f"[video]"
     )
 
-    if has_audio:
-        fc = (
-            video_filter
-            + ";"
-            "[0:a]"
-            "volume=0.18"
-            "[original_audio];"
-            "[original_audio][1:a]"
-            "amix="
-            "inputs=2:"
-            "duration=first:"
-            "dropout_transition=2"
-            "[audio]"
-        )
+    filter_complex = (
+        video_filter
+        + ";"
+        "[0:a]"
+        f"volume={ORIGINAL_AUDIO_VOLUME},"
+        "aresample=48000"
+        "[original];"
+        "[original][1:a]"
+        "amix=inputs=2:"
+        "duration=first:"
+        "dropout_transition=0:"
+        "normalize=1"
+        "[audio]"
+    )
 
-        maps = [
-            "-map",
-            "[video]",
-            "-map",
-            "[audio]"
-        ]
-
-    else:
-        fc = video_filter
-
-        maps = [
-            "-map",
-            "[video]",
-            "-map",
-            "1:a:0"
-        ]
-
-    subprocess.run(
+    run_ffmpeg(
         [
-            "ffmpeg",
-            "-hide_banner",
-            "-loglevel",
-            "error",
             "-y",
             "-i",
-            inp,
+            str(inp),
             "-i",
             str(voice_track),
             "-filter_complex",
-            fc,
-            *maps,
+            filter_complex,
+            "-map",
+            "[video]",
+            "-map",
+            "[audio]",
             "-c:v",
             "libx264",
             "-preset",
             "veryfast",
             "-crf",
             "23",
+            "-pix_fmt",
+            "yuv420p",
             "-c:a",
             "aac",
             "-b:a",
             "160k",
+            "-t",
+            f"{duration:.3f}",
             "-movflags",
             "+faststart",
-            out
-        ],
-        check=True
+            str(out)
+        ]
     )
 
 
-# =========================
+# ============================================================
 # SRT
-# =========================
+# ============================================================
 
 def write_srt(
     path,
@@ -916,61 +1760,59 @@ def write_srt(
     with open(
         path,
         "w",
-        encoding="utf-8-sig"
-    ) as f:
+        encoding="utf-8"
+    ) as file:
 
-        for number, seg in enumerate(
-            segments,
-            1
-        ):
+        number = 1
+
+        for segment in segments:
+
             start = max(
                 0,
-                seg["start"]
+                safe_float(
+                    segment.get("start"),
+                    0
+                )
             )
 
             end = max(
-                start + 0.3,
-                seg["end"]
+                start + 0.35,
+                safe_float(
+                    segment.get("end"),
+                    start + 0.35
+                )
             )
 
-            f.write(
+            text = str(
+                segment.get("vi", "")
+            ).strip()
+
+            text = re.sub(
+                r"[\r\n]+",
+                " ",
+                text
+            )
+
+            if not text:
+                continue
+
+            file.write(
                 f"{number}\n"
-                f"{ts(start)} --> "
-                f"{ts(end)}\n"
-                f"{seg['vi']}\n\n"
+                f"{timestamp(start)} --> "
+                f"{timestamp(end)}\n"
+                f"{text}\n\n"
             )
 
-
-# =========================
-# HELPERS
-# =========================
-
-def ffmpeg_path(path):
-    value = str(
-        Path(path).resolve()
-    ).replace(
-        "\\",
-        "/"
-    )
-
-    return (
-        value
-        .replace(
-            ":",
-            r"\:"
-        )
-        .replace(
-            "'",
-            r"\'"
-        )
-    )
+            number += 1
 
 
-def ts(seconds):
+def timestamp(seconds):
     ms = max(
         0,
         int(
-            seconds * 1000
+            round(
+                seconds * 1000
+            )
         )
     )
 
@@ -994,4 +1836,205 @@ def ts(seconds):
         f"{minutes:02}:"
         f"{secs:02},"
         f"{ms:03}"
+    )
+
+
+# ============================================================
+# FFMPEG
+# ============================================================
+
+def run_ffmpeg(args):
+    command = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error"
+    ] + list(args)
+
+    result = subprocess.run(
+        command,
+        capture_output=True,
+        text=True
+    )
+
+    if result.returncode != 0:
+        error = (
+            result.stderr.strip()
+            or "Không có thông tin lỗi."
+        )
+
+        raise RuntimeError(
+            "FFmpeg lỗi: " + error
+        )
+
+    return result
+
+
+def ffmpeg_subtitle_path(path):
+    value = str(
+        Path(path).resolve()
+    ).replace(
+        "\\",
+        "/"
+    )
+
+    # Escape dành cho FFmpeg filter parser.
+    value = value.replace(
+        "'",
+        r"\'"
+    )
+
+    value = value.replace(
+        ":",
+        r"\:"
+    )
+
+    return f"'{value}'"
+
+
+# ============================================================
+# OUTPUT
+# ============================================================
+
+def validate_output(path):
+    validate_file(
+        path,
+        "Video đầu ra không được tạo."
+    )
+
+    result = subprocess.run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-show_entries",
+            "stream=codec_type",
+            "-of",
+            "csv=p=0",
+            str(path)
+        ],
+        capture_output=True,
+        text=True
+    )
+
+    if result.returncode != 0:
+        raise RuntimeError(
+            "Video đầu ra bị lỗi."
+        )
+
+    if "video" not in result.stdout:
+        raise RuntimeError(
+            "Video đầu ra không có luồng video."
+        )
+
+
+def validate_file(
+    path,
+    message
+):
+    path = Path(path)
+
+    if (
+        not path.exists()
+        or not path.is_file()
+        or path.stat().st_size < 1024
+    ):
+        raise RuntimeError(
+            message
+        )
+
+
+# ============================================================
+# ERROR HELPERS
+# ============================================================
+
+def is_auth_error(text):
+    text = str(
+        text or ""
+    ).lower()
+
+    return (
+        "401" in text
+        or "invalid_api_key" in text
+        or "incorrect api key" in text
+        or "authentication" in text
+    )
+
+
+def is_permanent_error(text):
+    text = str(
+        text or ""
+    ).lower()
+
+    return (
+        "400" in text
+        or "unsupported" in text
+        or "invalid file" in text
+        or "invalid_request" in text
+        or "file too large" in text
+    )
+
+
+def retry_delay(
+    text,
+    attempt
+):
+    text = str(
+        text or ""
+    ).lower()
+
+    if (
+        "429" in text
+        or "rate limit" in text
+        or "too many requests" in text
+    ):
+        return min(
+            10,
+            2 ** attempt
+        )
+
+    if (
+        "timeout" in text
+        or "timed out" in text
+    ):
+        return min(
+            8,
+            2 + attempt * 2
+        )
+
+    return min(
+        6,
+        1.5 + attempt
+    )
+
+
+# ============================================================
+# BASIC HELPERS
+# ============================================================
+
+def safe_float(
+    value,
+    default=0.0
+):
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+
+def safe_int(
+    value,
+    default=0
+):
+    try:
+        return int(value)
+    except Exception:
+        return default
+
+
+def even(value):
+    return (
+        max(2, int(value))
+        // 2
+        * 2
     )
