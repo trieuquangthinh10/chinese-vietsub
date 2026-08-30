@@ -1,153 +1,119 @@
-const input = document.getElementById("video");
-const dropzone = document.getElementById("dropzone");
-const fileInfo = document.getElementById("fileInfo");
-const fileName = document.getElementById("fileName");
-const fileSize = document.getElementById("fileSize");
-const removeFile = document.getElementById("removeFile");
-const previewCard = document.getElementById("previewCard");
-const preview = document.getElementById("preview");
+coónt const input = document.getElementById("video");
 const go = document.getElementById("go");
 const status = document.getElementById("status");
 const bar = document.getElementById("bar");
 const percent = document.getElementById("percent");
 const result = document.getElementById("result");
-const themeBtn = document.getElementById("themeBtn");
 
 let file = null;
-let objectUrl = null;
-let timer = null;
 
-function formatSize(bytes) {
-  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(0) + " KB";
-  return (bytes / 1024 / 1024).toFixed(1) + " MB";
+input.addEventListener("change", function () {
+    file = this.files && this.files.length ? this.files[0] : null;
+
+    if (!file) {
+        go.disabled = true;
+        status.textContent = "Chưa chọn video";
+        return;
+    }
+
+    go.disabled = false;
+    status.textContent = "Đã chọn: " + file.name;
+});
+
+function progress(p, text) {
+    p = Math.max(0, Math.min(100, p));
+    bar.style.width = p + "%";
+    percent.textContent = Math.round(p) + "%";
+    if (text) status.textContent = text;
 }
 
-function setProgress(value, text) {
-  const p = Math.max(0, Math.min(100, Number(value) || 0));
-  bar.style.width = p + "%";
-  percent.textContent = p + "%";
-  if (text) status.textContent = text;
-}
+go.addEventListener("click", function () {
+    if (!file) {
+        status.textContent = "❌ Chưa chọn video";
+        return;
+    }
 
-function chooseFile(selectedFile) {
-  if (!selectedFile) return;
+    go.disabled = true;
+    result.classList.add("hidden");
 
-  file = selectedFile;
-  fileName.textContent = file.name;
-  fileSize.textContent = formatSize(file.size);
-
-  fileInfo.classList.remove("hidden");
-  dropzone.classList.add("has-file");
-  previewCard.classList.remove("hidden");
-  go.disabled = false;
-  result.classList.add("hidden");
-  setProgress(0, "Đã chọn video. Bấm “Bắt đầu dịch”.");
-
-  if (objectUrl) URL.revokeObjectURL(objectUrl);
-  objectUrl = URL.createObjectURL(file);
-  preview.src = objectUrl;
-  preview.load();
-}
-
-/* iPhone/Safari: change là sự kiện chính; input chỉ reset sau khi xoá. */
-input.addEventListener("change", () => {
-  chooseFile(input.files && input.files[0]);
-});
-
-removeFile.addEventListener("click", (e) => {
-  e.preventDefault();
-  file = null;
-  input.value = "";
-  fileInfo.classList.add("hidden");
-  dropzone.classList.remove("has-file");
-  previewCard.classList.add("hidden");
-  preview.removeAttribute("src");
-  go.disabled = true;
-  setProgress(0, "Chọn một video để bắt đầu.");
-  if (objectUrl) {
-    URL.revokeObjectURL(objectUrl);
-    objectUrl = null;
-  }
-});
-
-["dragenter", "dragover"].forEach(type => {
-  dropzone.addEventListener(type, e => {
-    e.preventDefault();
-    dropzone.classList.add("dragging");
-  });
-});
-["dragleave", "drop"].forEach(type => {
-  dropzone.addEventListener(type, e => {
-    e.preventDefault();
-    dropzone.classList.remove("dragging");
-  });
-});
-dropzone.addEventListener("drop", e => {
-  const f = e.dataTransfer.files && e.dataTransfer.files[0];
-  chooseFile(f);
-});
-
-go.addEventListener("click", async () => {
-  if (!file) return;
-
-  go.disabled = true;
-  result.classList.add("hidden");
-  setProgress(5, "Đang upload video…");
-
-  try {
     const fd = new FormData();
     fd.append("video", file, file.name);
 
-    const up = await fetch("/api/upload", { method: "POST", body: fd });
-    const uj = await up.json();
-    if (!up.ok) throw new Error(uj.error || "Upload thất bại.");
+    progress(0, "Đang chuẩn bị upload…");
 
-    setProgress(15, "Đang bắt đầu dịch…");
+    const xhr = new XMLHttpRequest();
 
-    const tr = await fetch("/api/translate/" + encodeURIComponent(uj.job_id), {
-      method: "POST"
-    });
-    if (!tr.ok) {
-      const tj = await tr.json().catch(() => ({}));
-      throw new Error(tj.error || "Không thể bắt đầu dịch.");
-    }
+    xhr.open("POST", "/api/upload");
 
-    clearInterval(timer);
-    timer = setInterval(async () => {
-      try {
-        const r = await fetch("/api/status/" + encodeURIComponent(uj.job_id), {
-          cache: "no-store"
+    xhr.upload.onprogress = function (e) {
+        if (e.lengthComputable) {
+            const p = (e.loaded / e.total) * 15;
+            progress(p, "Đang upload video… " + Math.round((e.loaded / e.total) * 100) + "%");
+        }
+    };
+
+    xhr.onload = async function () {
+        if (xhr.status < 200 || xhr.status >= 300) {
+            let msg = "Upload thất bại";
+            try {
+                msg = JSON.parse(xhr.responseText).error || msg;
+            } catch {}
+            progress(0, "❌ " + msg);
+            go.disabled = false;
+            return;
+        }
+
+        const data = JSON.parse(xhr.responseText);
+        const jid = data.job_id;
+
+        progress(15, "Đã upload. Đang bắt đầu dịch…");
+
+        const tr = await fetch("/api/translate/" + encodeURIComponent(jid), {
+            method: "POST"
         });
-        const s = await r.json();
 
-        setProgress(s.progress || 0, s.status_text || "Đang xử lý…");
-
-        if (s.status === "done") {
-          clearInterval(timer);
-          setProgress(100, "🎉 Vietsub đã hoàn tất!");
-          result.href = "/api/result/" + encodeURIComponent(uj.job_id);
-          result.classList.remove("hidden");
-          go.disabled = false;
+        if (!tr.ok) {
+            progress(0, "❌ Không thể bắt đầu dịch");
+            go.disabled = false;
+            return;
         }
 
-        if (s.status === "error") {
-          clearInterval(timer);
-          status.textContent = "❌ " + (s.error || "Có lỗi xảy ra.");
-          go.disabled = false;
-        }
-      } catch (err) {
-        clearInterval(timer);
-        status.textContent = "❌ " + err.message;
+        const timer = setInterval(async () => {
+            try {
+                const r = await fetch("/api/status/" + encodeURIComponent(jid));
+                const s = await r.json();
+
+                progress(
+                    s.progress || 0,
+                    s.status_text || "Đang xử lý…"
+                );
+
+                if (s.status === "done") {
+                    clearInterval(timer);
+                    progress(100, "🎉 Hoàn tất!");
+                    result.href = "/api/result/" + encodeURIComponent(jid);
+                    result.classList.remove("hidden");
+                    go.disabled = false;
+                }
+
+                if (s.status === "error") {
+                    clearInterval(timer);
+                    progress(0, "❌ " + (s.error || "Có lỗi xảy ra"));
+                    go.disabled = false;
+                }
+
+            } catch (e) {
+                clearInterval(timer);
+                progress(0, "❌ Mất kết nối server");
+                go.disabled = false;
+            }
+        }, 1000);
+    };
+
+    xhr.onerror = function () {
+        progress(0, "❌ Upload lỗi hoặc mất kết nối");
         go.disabled = false;
-      }
-    }, 1000);
-  } catch (err) {
-    status.textContent = "❌ " + err.message;
-    go.disabled = false;
-  }
-});
+    };
 
-themeBtn.addEventListener("click", () => {
-  document.body.classList.toggle("light");
-  themeBtn.textContent = document.body.classList.contains("light") ? "☾" : "☼";
+    xhr.send(fd);
 });
