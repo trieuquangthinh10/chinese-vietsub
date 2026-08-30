@@ -8,12 +8,14 @@ const result = document.getElementById("result");
 const preview = document.getElementById("preview");
 const video = document.getElementById("videoPreview");
 const area = document.getElementById("subtitleArea");
+const percent = document.getElementById("percent");
 
 let file = null;
 let jobId = null;
 
 let dragging = false;
 let resizing = false;
+
 let startX = 0;
 let startY = 0;
 
@@ -25,16 +27,19 @@ let region = {
 };
 
 
-// =========================================================
+// =====================================================
 // CHỌN VIDEO
-// =========================================================
+// =====================================================
 
 input.addEventListener("change", () => {
 
     if (!input.files || input.files.length === 0) {
+
         file = null;
 
-        selected.textContent = "Chưa chọn video";
+        selected.textContent =
+            "Chưa chọn video";
+
         go.disabled = true;
 
         if (preview) {
@@ -55,29 +60,28 @@ input.addEventListener("change", () => {
     go.disabled = false;
 
     status.textContent =
-        "Video đã sẵn sàng. Kiểm tra vùng phụ đề rồi bấm Bắt đầu dịch.";
+        "Video đã sẵn sàng. Đang chuẩn bị trình chỉnh sửa…";
 
     if (preview) {
         preview.hidden = false;
     }
 
-    const url = URL.createObjectURL(file);
+    const url =
+        URL.createObjectURL(file);
 
     video.src = url;
-
     video.load();
-
-    resetRegion();
 });
 
 
-// =========================================================
-// FORMAT SIZE
-// =========================================================
+// =====================================================
+// DUNG LƯỢNG FILE
+// =====================================================
 
 function formatSize(bytes) {
 
     if (bytes < 1024 * 1024) {
+
         return (
             (bytes / 1024).toFixed(1) +
             " KB"
@@ -91,9 +95,49 @@ function formatSize(bytes) {
 }
 
 
-// =========================================================
-// VÙNG PHỤ ĐỀ
-// =========================================================
+// =====================================================
+// VIDEO LOAD
+// TỰ ĐỘNG GIỮ NGUYÊN TỈ LỆ VIDEO
+// =====================================================
+
+video.addEventListener(
+    "loadedmetadata",
+    () => {
+
+        const width =
+            video.videoWidth;
+
+        const height =
+            video.videoHeight;
+
+        if (width && height) {
+
+            const wrap =
+                document.querySelector(
+                    ".video-wrap"
+                );
+
+            if (wrap) {
+
+                // 16:9, 9:16, 4:3, 1:1...
+                // đều tự lấy đúng tỉ lệ gốc
+
+                wrap.style.aspectRatio =
+                    `${width} / ${height}`;
+            }
+        }
+
+        resetRegion();
+
+        status.textContent =
+            "Kéo khung xanh đến đúng vị trí phụ đề cũ.";
+    }
+);
+
+
+// =====================================================
+// RESET VÙNG PHỤ ĐỀ
+// =====================================================
 
 function resetRegion() {
 
@@ -107,6 +151,10 @@ function resetRegion() {
     updateArea();
 }
 
+
+// =====================================================
+// CẬP NHẬT KHUNG
+// =====================================================
 
 function updateArea() {
 
@@ -128,9 +176,9 @@ function updateArea() {
 }
 
 
-// =========================================================
-// DRAG VÙNG
-// =========================================================
+// =====================================================
+// BẮT ĐẦU KÉO KHUNG
+// =====================================================
 
 if (area) {
 
@@ -144,9 +192,13 @@ if (area) {
 function startDrag(e) {
 
     if (
-        e.target.classList.contains("resize")
+        e.target.classList.contains(
+            "resize"
+        )
     ) {
+
         startResize(e);
+
         return;
     }
 
@@ -159,9 +211,17 @@ function startDrag(e) {
     startX = e.clientX;
     startY = e.clientY;
 
-    area.classList.add("moving");
+    area.classList.add(
+        "moving"
+    );
+
+    e.preventDefault();
 }
 
+
+// =====================================================
+// DI CHUYỂN / RESIZE
+// =====================================================
 
 document.addEventListener(
     "pointermove",
@@ -174,6 +234,10 @@ document.addEventListener(
         const rect =
             video.getBoundingClientRect();
 
+        if (!rect.width || !rect.height) {
+            return;
+        }
+
         const dx =
             (e.clientX - startX) /
             rect.width;
@@ -182,67 +246,90 @@ document.addEventListener(
             (e.clientY - startY) /
             rect.height;
 
+
+        // ---------------------------------------------
+        // KÉO
+        // ---------------------------------------------
+
         if (dragging) {
 
             region.x += dx;
             region.y += dy;
 
-            region.x = Math.max(
-                0,
-                Math.min(
-                    1 - region.w,
-                    region.x
-                )
-            );
+            region.x =
+                Math.max(
+                    0,
+                    Math.min(
+                        1 - region.w,
+                        region.x
+                    )
+                );
 
-            region.y = Math.max(
-                0,
-                Math.min(
-                    1 - region.h,
-                    region.y
-                )
-            );
-
+            region.y =
+                Math.max(
+                    0,
+                    Math.min(
+                        1 - region.h,
+                        region.y
+                    )
+                );
         }
+
+
+        // ---------------------------------------------
+        // RESIZE
+        // ---------------------------------------------
 
         if (resizing) {
 
             region.w += dx;
             region.h += dy;
 
-            region.w = Math.max(
-                0.05,
-                Math.min(
-                    1 - region.x,
-                    region.w
-                )
-            );
+            region.w =
+                Math.max(
+                    0.05,
+                    Math.min(
+                        1 - region.x,
+                        region.w
+                    )
+                );
 
-            region.h = Math.max(
-                0.05,
-                Math.min(
-                    1 - region.y,
-                    region.h
-                )
-            );
+            region.h =
+                Math.max(
+                    0.05,
+                    Math.min(
+                        1 - region.y,
+                        region.h
+                    )
+                );
         }
 
         startX = e.clientX;
         startY = e.clientY;
 
         updateArea();
+
+        e.preventDefault();
+    },
+    {
+        passive: false
     }
 );
 
 
+// =====================================================
+// THẢ CHUỘT / NGÓN TAY
+// =====================================================
+
 document.addEventListener(
     "pointerup",
-    e => {
+    () => {
 
         dragging = false;
         resizing = false;
 
         if (area) {
+
             area.classList.remove(
                 "moving"
             );
@@ -251,9 +338,9 @@ document.addEventListener(
 );
 
 
-// =========================================================
-// RESIZE
-// =========================================================
+// =====================================================
+// RESIZE HANDLE
+// =====================================================
 
 function startResize(e) {
 
@@ -267,12 +354,13 @@ function startResize(e) {
     startY = e.clientY;
 
     e.stopPropagation();
+    e.preventDefault();
 }
 
 
-// =========================================================
+// =====================================================
 // BẮT ĐẦU DỊCH
-// =========================================================
+// =====================================================
 
 go.addEventListener(
     "click",
@@ -292,14 +380,17 @@ go.addEventListener(
 
         bar.value = 5;
 
+        updatePercent(5);
+
         status.textContent =
             "Đang upload video…";
 
+
         try {
 
-            // ---------------------------------------------
+            // =============================================
             // UPLOAD
-            // ---------------------------------------------
+            // =============================================
 
             const form =
                 new FormData();
@@ -335,13 +426,15 @@ go.addEventListener(
 
             bar.value = 10;
 
+            updatePercent(10);
+
             status.textContent =
                 "Upload thành công. Đang bắt đầu xử lý…";
 
 
-            // ---------------------------------------------
-            // TRANSLATE
-            // ---------------------------------------------
+            // =============================================
+            // BẮT ĐẦU TRANSLATE
+            // =============================================
 
             const translateResponse =
                 await fetch(
@@ -373,19 +466,15 @@ go.addEventListener(
             }
 
 
-            // ---------------------------------------------
-            // THEO DÕI TIẾN ĐỘ
-            // ---------------------------------------------
+            // =============================================
+            // THEO DÕI
+            // =============================================
 
-            await watchJob(
-                jobId
-            );
+            await watchJob(jobId);
 
         } catch (error) {
 
-            console.error(
-                error
-            );
+            console.error(error);
 
             status.textContent =
                 "❌ " +
@@ -400,17 +489,15 @@ go.addEventListener(
 );
 
 
-// =========================================================
-// POLLING JOB
-// =========================================================
+// =====================================================
+// THEO DÕI TIẾN ĐỘ
+// =====================================================
 
 async function watchJob(id) {
 
     while (true) {
 
-        await sleep(
-            1200
-        );
+        await sleep(1200);
 
         const response =
             await fetch(
@@ -431,9 +518,9 @@ async function watchJob(id) {
             await response.json();
 
 
-        // ---------------------------------------------
+        // =============================================
         // PROGRESS
-        // ---------------------------------------------
+        // =============================================
 
         if (
             typeof data.progress ===
@@ -442,6 +529,10 @@ async function watchJob(id) {
 
             bar.value =
                 data.progress;
+
+            updatePercent(
+                data.progress
+            );
         }
 
 
@@ -452,9 +543,9 @@ async function watchJob(id) {
         }
 
 
-        // ---------------------------------------------
-        // DONE
-        // ---------------------------------------------
+        // =============================================
+        // HOÀN TẤT
+        // =============================================
 
         if (
             data.status ===
@@ -463,8 +554,10 @@ async function watchJob(id) {
 
             bar.value = 100;
 
+            updatePercent(100);
+
             status.textContent =
-                "🎉 Dịch, che phụ đề và lồng tiếng hoàn tất!";
+                "🎉 Hoàn tất! Video Vietsub đã sẵn sàng.";
 
             result.href =
                 "/api/result/" +
@@ -478,9 +571,9 @@ async function watchJob(id) {
         }
 
 
-        // ---------------------------------------------
-        // ERROR
-        // ---------------------------------------------
+        // =============================================
+        // LỖI
+        // =============================================
 
         if (
             data.status ===
@@ -496,9 +589,25 @@ async function watchJob(id) {
 }
 
 
-// =========================================================
-// SLEEP
-// =========================================================
+// =====================================================
+// HIỂN THỊ %
+// =====================================================
+
+function updatePercent(value) {
+
+    if (!percent) {
+        return;
+    }
+
+    percent.textContent =
+        Math.round(value) +
+        "%";
+}
+
+
+// =====================================================
+// DELAY
+// =====================================================
 
 function sleep(ms) {
 
@@ -512,29 +621,9 @@ function sleep(ms) {
 }
 
 
-// =========================================================
-// VIDEO LOAD
-// =========================================================
-
-if (video) {
-
-    video.addEventListener(
-        "loadedmetadata",
-        () => {
-
-            resetRegion();
-
-            status.textContent =
-                "Kéo khung xanh đến đúng vị trí phụ đề cũ.";
-        }
-    );
-}
-
-
-// =========================================================
-// PHÍM R
-// RESET VÙNG
-// =========================================================
+// =====================================================
+// PHÍM R = RESET
+// =====================================================
 
 document.addEventListener(
     "keydown",
@@ -546,6 +635,7 @@ document.addEventListener(
         ) {
 
             if (
+                document.activeElement &&
                 document.activeElement.tagName ===
                 "INPUT"
             ) {
