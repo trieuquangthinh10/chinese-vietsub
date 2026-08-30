@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#0b1020">
+<title>VietSub AI — Chinese → Vietnamese</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<div class="bg-orb orb-a"></div>
+<div class="bg-orb orb-b"></div>
+
+<header class="topbar">
+  <div class="brand">
+    <div class="brand-mark">VS</div>
+    <div>
+      <strong>VietSub AI</strong>
+      <span>Chinese → Vietnamese</span>
+    </div>
+  </div>
+  <div class="top-actions">
+    <span class="status-dot"><i></i> AI Online</span>
+    <button class="icon-btn" id="themeBtn" aria-label="Đổi giao diện">☼</button>
+  </div>
+</header>
+
+<main class="container">
+  <section class="hero">
+    <div class="eyebrow">AI VIDEO TRANSLATOR</div>
+    <h1>Biến video tiếng Trung<br><span>thành Vietsub tự nhiên.</span></h1>
+    <p>Upload video, chọn vùng phụ đề nếu cần và để AI xử lý phần còn lại.</p>
+  </section>
+
+  <section class="workspace">
+    <div class="card upload-card">
+      <div class="card-head">
+        <div>
+          <div class="label">01 · VIDEO INPUT</div>
+          <h2>Chọn video của bạn</h2>
+        </div>
+        <span class="pill">MP4 · MOV · MKV · WEBM</span>
+      </div>
+
+      <label class="dropzone" id="dropzone">
+        <input id="video" type="file" accept="video/*,.mp4,.mov,.mkv,.webm">
+        <div class="upload-icon">↑</div>
+        <strong>Chạm để chọn video</strong>
+        <span>Hoặc kéo thả video vào đây</span>
+      </label>
+
+      <div id="fileInfo" class="file-info hidden">
+        <div class="file-icon">▶</div>
+        <div class="file-meta">
+          <strong id="fileName">—</strong>
+          <span id="fileSize">—</span>
+        </div>
+        <button id="removeFile" class="remove-btn">×</button>
+      </div>
+    </div>
+
+    <div id="previewCard" class="card preview-card hidden">
+      <div class="card-head">
+        <div>
+          <div class="label">02 · SUBTITLE REGION</div>
+          <h2>Chọn vùng phụ đề</h2>
+        </div>
+        <span class="pill accent">Tuỳ chọn</span>
+      </div>
+
+      <div class="video-wrap">
+        <video id="preview" playsinline controls></video>
+        <div id="region" class="region">
+          <span>Vùng phụ đề</span>
+        </div>
+      </div>
+
+      <div class="region-hint">
+        <span>↔</span>
+        Kéo khung để phủ lên khu vực phụ đề cũ. AI sẽ dùng vùng này cho bước xử lý phụ đề.
+      </div>
+    </div>
+
+    <div class="card action-card">
+      <div class="pipeline">
+        <div class="step active"><b>01</b><span>Upload</span></div>
+        <div class="line"></div>
+        <div class="step"><b>02</b><span>Translate</span></div>
+        <div class="line"></div>
+        <div class="step"><b>03</b><span>Render</span></div>
+      </div>
+
+      <button id="go" class="primary-btn" disabled>
+        <span>🚀</span> Bắt đầu dịch video
+      </button>
+
+      <div class="progress-area">
+        <div class="progress-top">
+          <span id="status">Chọn một video để bắt đầu.</span>
+          <b id="percent">0%</b>
+        </div>
+        <div class="progress"><i id="bar"></i></div>
+      </div>
+
+      <a id="result" class="result-btn hidden">🎬 Mở / tải video Vietsub</a>
+    </div>
+  </section>
+
+  <section class="features">
+    <div><b>AI Context</b><span>Dịch theo ngữ cảnh, giữ xưng hô & tên riêng.</span></div>
+    <div><b>Private Processing</b><span>API key chỉ nằm trên server.</span></div>
+    <div><b>iPhone Ready</b><span>Thiết kế tối ưu cho màn hình cảm ứng.</span></div>
+  </section>
+</main>
+
+<footer>VIETSUB AI · CHINESE → VIETNAMESE · VIDEO TRANSLATION</footer>
+<script src="/app.js"></script>
+</body>
+</html>
