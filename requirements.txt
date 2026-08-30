@@ -1,4 +1,0 @@
-flask>=3.0,<4
-openai>=1.40
-werkzeug>=3.0
-gunicorn>=22
