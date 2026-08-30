@@ -17,15 +17,17 @@ OUTPUTS = BASE / "outputs"
 UPLOADS.mkdir(exist_ok=True)
 OUTPUTS.mkdir(exist_ok=True)
 
-
 app = Flask(__name__)
+
+# Cho phép upload video lớn
+app.config["MAX_CONTENT_LENGTH"] = 2 * 1024 * 1024 * 1024
 
 jobs = {}
 
 
-# =========================
+# =========================================================
 # WEB
-# =========================
+# =========================================================
 
 @app.get("/")
 def home():
@@ -50,9 +52,9 @@ def style_css():
     )
 
 
-# =========================
-# UPLOAD VIDEO
-# =========================
+# =========================================================
+# UPLOAD
+# =========================================================
 
 @app.post("/api/upload")
 def upload():
@@ -61,44 +63,58 @@ def upload():
 
     if not f or not f.filename:
         return jsonify(
-            error="Chưa nhận được video."
+            ok=False,
+            error="Chưa chọn video."
         ), 400
 
-    jid = str(uuid.uuid4())
+    filename = secure_filename(f.filename)
 
-    safe = secure_filename(
-        f.filename
-    ) or "video.mp4"
+    if not filename:
+        filename = "video.mp4"
 
-    path = UPLOADS / f"{jid}_{safe}"
+    job_id = str(uuid.uuid4())
 
-    f.save(path)
+    video_path = UPLOADS / f"{job_id}_{filename}"
 
-    jobs[jid] = {
-        "input": str(path),
+    try:
+        f.save(video_path)
+    except Exception as e:
+        return jsonify(
+            ok=False,
+            error=f"Không thể lưu video: {e}"
+        ), 500
+
+    jobs[job_id] = {
+        "input": str(video_path),
+        "output": None,
+        "region": None,
         "progress": 5,
         "status": "uploaded",
-        "status_text": "Đã upload video."
+        "status_text": "Đã nhận video."
     }
 
     return jsonify(
-        job_id=jid
+        ok=True,
+        job_id=job_id
     )
 
 
-# =========================
+# =========================================================
 # START TRANSLATION
-# =========================
+# =========================================================
 
-@app.post("/api/translate/<jid>")
-def translate(jid):
+@app.post("/api/translate/<job_id>")
+def translate(job_id):
 
-    if jid not in jobs:
+    if job_id not in jobs:
         return jsonify(
+            ok=False,
             error="Không tìm thấy video."
         ), 404
 
-    if jobs[jid]["status"] == "processing":
+    job = jobs[job_id]
+
+    if job["status"] == "processing":
         return jsonify(ok=True)
 
     data = request.get_json(
@@ -107,158 +123,195 @@ def translate(jid):
 
     region = data.get("region")
 
-    # Nếu không chọn vùng thì dùng
-    # vùng phụ đề phía dưới màn hình
-    if not region:
+    # Vùng mặc định:
+    # 5% từ trái
+    # 68% từ trên
+    # rộng 90%
+    # cao 27%
+    if not isinstance(region, dict):
         region = {
             "x": 0.05,
-            "y": 0.70,
+            "y": 0.68,
             "w": 0.90,
-            "h": 0.25
+            "h": 0.27
         }
 
-    # Kiểm tra region
-    required = ["x", "y", "w", "h"]
+    try:
+        region = {
+            "x": float(region.get("x", 0.05)),
+            "y": float(region.get("y", 0.68)),
+            "w": float(region.get("w", 0.90)),
+            "h": float(region.get("h", 0.27))
+        }
+    except (TypeError, ValueError):
+        return jsonify(
+            ok=False,
+            error="Vùng phụ đề không hợp lệ."
+        ), 400
 
-    for key in required:
-        if key not in region:
-            return jsonify(
-                error=f"Thiếu vùng {key}."
-            ), 400
-
-        try:
-            region[key] = float(
-                region[key]
-            )
-        except:
-            return jsonify(
-                error="Vùng chọn không hợp lệ."
-            ), 400
-
-    # Giới hạn an toàn
+    # Giới hạn
     region["x"] = max(
-        0,
-        min(1, region["x"])
+        0.0,
+        min(1.0, region["x"])
     )
 
     region["y"] = max(
-        0,
-        min(1, region["y"])
+        0.0,
+        min(1.0, region["y"])
     )
 
     region["w"] = max(
         0.01,
-        min(1, region["w"])
+        min(1.0, region["w"])
     )
 
     region["h"] = max(
         0.01,
-        min(1, region["h"])
+        min(1.0, region["h"])
     )
 
-    jobs[jid]["region"] = region
+    # Không cho vùng vượt màn hình
+    if region["x"] + region["w"] > 1:
+        region["w"] = 1 - region["x"]
+
+    if region["y"] + region["h"] > 1:
+        region["h"] = 1 - region["y"]
+
+    job["region"] = region
 
     threading.Thread(
-        target=run,
-        args=(jid,),
+        target=run_translation,
+        args=(job_id,),
         daemon=True
     ).start()
 
-    return jsonify(
-        ok=True
-    )
+    return jsonify(ok=True)
 
 
-# =========================
-# PROCESS VIDEO
-# =========================
+# =========================================================
+# PROCESS
+# =========================================================
 
-def run(jid):
+def run_translation(job_id):
+
+    job = jobs[job_id]
 
     try:
 
-        jobs[jid].update(
+        job.update(
             status="processing",
-            progress=15,
-            status_text="Đang xử lý video…"
+            progress=10,
+            status_text="Đang chuẩn bị video…"
         )
 
-        out = OUTPUTS / (
-            f"{jid}_VIETSUB.mp4"
+        output_path = OUTPUTS / (
+            f"{job_id}_VIETSUB.mp4"
         )
 
-        def cb(progress, text):
+        def callback(progress, text):
 
-            jobs[jid].update(
-                progress=int(progress),
-                status_text=text
+            job.update(
+                progress=max(
+                    0,
+                    min(100, int(progress))
+                ),
+                status_text=str(text)
             )
 
         process(
-            jobs[jid]["input"],
-            str(out),
-            cb,
-            jobs[jid]["region"]
+            job["input"],
+            str(output_path),
+            callback,
+            job["region"]
         )
 
-        jobs[jid].update(
-            output=str(out),
+        if not output_path.exists():
+            raise RuntimeError(
+                "Quá trình xử lý kết thúc nhưng không tìm thấy video đầu ra."
+            )
+
+        job.update(
+            output=str(output_path),
             progress=100,
             status="done",
-            status_text="Hoàn tất!"
+            status_text="🎉 Hoàn tất!"
         )
 
     except Exception as e:
 
-        jobs[jid].update(
+        job.update(
+            progress=0,
             status="error",
             error=str(e),
-            status_text="Không thể xử lý video."
+            status_text="❌ Có lỗi khi xử lý video."
         )
 
 
-# =========================
+# =========================================================
 # STATUS
-# =========================
+# =========================================================
 
-@app.get("/api/status/<jid>")
-def status(jid):
+@app.get("/api/status/<job_id>")
+def status(job_id):
 
-    return jsonify(
-        jobs.get(
-            jid,
-            {
-                "status": "unknown"
-            }
-        )
-    )
+    if job_id not in jobs:
+        return jsonify(
+            status="unknown",
+            error="Không tìm thấy job."
+        ), 404
+
+    return jsonify(jobs[job_id])
 
 
-# =========================
+# =========================================================
 # RESULT
-# =========================
+# =========================================================
 
-@app.get("/api/result/<jid>")
-def result(jid):
+@app.get("/api/result/<job_id>")
+def result(job_id):
 
-    job = jobs.get(jid)
+    if job_id not in jobs:
+        return jsonify(
+            error="Không tìm thấy job."
+        ), 404
 
-    if not job or "output" not in job:
+    job = jobs[job_id]
 
+    output = job.get("output")
+
+    if (
+        job.get("status") != "done"
+        or not output
+        or not Path(output).exists()
+    ):
         return jsonify(
             error="Video chưa sẵn sàng."
         ), 404
 
     return send_file(
-        job["output"],
+        output,
         as_attachment=True,
-        download_name="video_VIETSUB.mp4"
+        download_name="video_VIETSUB.mp4",
+        mimetype="video/mp4"
     )
 
 
-# =========================
-# START SERVER
-# =========================
+# =========================================================
+# ERROR: FILE QUÁ LỚN
+# =========================================================
+
+@app.errorhandler(413)
+def file_too_large(error):
+
+    return jsonify(
+        ok=False,
+        error="Video quá lớn. Giới hạn là 2GB."
+    ), 413
+
+
+# =========================================================
+# SERVER
+# =========================================================
 
 if __name__ == "__main__":
 
