@@ -1,4 +1,3 @@
-```python
 import os
 import json
 import subprocess
@@ -996,4 +995,3 @@ def ts(seconds):
         f"{secs:02},"
         f"{ms:03}"
     )
-```
