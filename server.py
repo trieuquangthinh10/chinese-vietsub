@@ -4,7 +4,7 @@ from flask import Flask, request, jsonify, send_file, send_from_directory
 from werkzeug.utils import secure_filename
 from translator import process
 
-BASE = Path(__file__).resolve().parent.parent
+BASE = Path(__file__).resolve().parent
 UPLOADS = BASE / "uploads"
 OUTPUTS = BASE / "outputs"
 FRONTEND = BASE 
